@@ -1,0 +1,17 @@
+services:
+  dji-proxy:
+    image: dji-stream-proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dji-stream-proxy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./stream_proxy.py:/app/stream_proxy.py:ro
+      - ./data:/app/data    # 持久化机巢 deviceId 列表（nests.json）
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
