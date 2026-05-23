@@ -12,5 +12,4 @@ bag/
 drone/
 *.tar.gz
 *.tar
-drone.zip
 .drone/
