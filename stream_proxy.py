@@ -125,7 +125,39 @@ _cache: Dict[str, CacheEntry] = {}  # deviceId -> CacheEntry
 _api_status: Dict[str, str] = {}  # deviceId -> "warming"|"ready"|"failed"
 _flv_alive: Dict[str, str] = {}  # flv_url  -> "alive"|"dead"|"connecting"
 _flv_tasks: Dict[str, "asyncio.Task"] = {}  # flv_url -> asyncio 保活任务
+# 每个 flv_url 最近 1 小时的断流时间戳列表(用于稳定性诊断)
+_flv_break_log: Dict[str, List[float]] = {}
 _session: Optional[aiohttp.ClientSession] = None
+
+
+def _record_flv_break(flv_url: str) -> None:
+    """记录一次上游断流,自动截断 1 小时窗口"""
+    if not flv_url:
+        return
+    now = time.time()
+    lst = _flv_break_log.setdefault(flv_url, [])
+    lst.append(now)
+    cutoff = now - 3600
+    # 原地截断
+    _flv_break_log[flv_url] = [t for t in lst if t >= cutoff]
+
+
+def _device_breaks_1h(device_id: str) -> int:
+    """通过 device_id → 当前 flv_url → 近 1 小时断流次数"""
+    entry = _cache.get(device_id)
+    if not entry or not entry.flv_url:
+        return 0
+    now = time.time()
+    cutoff = now - 3600
+    return sum(1 for t in _flv_break_log.get(entry.flv_url, []) if t >= cutoff)
+
+
+def _device_last_break(device_id: str) -> Optional[float]:
+    entry = _cache.get(device_id)
+    if not entry or not entry.flv_url:
+        return None
+    lst = _flv_break_log.get(entry.flv_url, [])
+    return lst[-1] if lst else None
 
 
 # ── 持久化 ─────────────────────────────────────────────
@@ -365,6 +397,22 @@ async def _call_startlive(device_id: str, access_token: str) -> aiohttp.ClientRe
     )
 
 
+# 同一 device_id 同时只跑一个 prewarm,避免多 tab/重连并发触发 N 路 startLive
+_prewarm_inflight: Dict[str, "asyncio.Task"] = {}
+
+
+async def prewarm_dedupe(device_id: str) -> bool:
+    t = _prewarm_inflight.get(device_id)
+    if t and not t.done():
+        return await t
+    task = asyncio.create_task(prewarm(device_id))
+    _prewarm_inflight[device_id] = task
+    try:
+        return await task
+    finally:
+        _prewarm_inflight.pop(device_id, None)
+
+
 async def prewarm(device_id: str) -> bool:
     _api_status[device_id] = "warming"
     # 先确保 token 有效
@@ -460,10 +508,12 @@ async def flv_worker_async(flv_url: str):
                             if chunks > 50:  # 初始帧读完后节流
                                 await asyncio.sleep(1.0 / FLV_CHUNKS_PER_SECOND)
                     log.warning(f"[FLV] 流断开，重连 → {flv_url}")
+                    _record_flv_break(flv_url)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.warning(f"[FLV] 异常: {e}")
+                _record_flv_break(flv_url)
             _flv_alive[flv_url] = "dead"
             await asyncio.sleep(RECONNECT_DELAY)
     except asyncio.CancelledError:
@@ -496,6 +546,7 @@ def stop_keepalive(flv_url: str):
     if task and not task.done():
         task.cancel()
     _flv_alive.pop(flv_url, None)
+    _flv_break_log.pop(flv_url, None)  # url 切换后旧统计无意义,清掉
 
 
 # ── 后台刷新 ───────────────────────────────────────────
@@ -512,7 +563,7 @@ async def bg_refresh():
             if stale:
                 log.info(f"♻️ 刷新 {len(stale)} 个过期机巢")
                 await asyncio.gather(
-                    *[prewarm(d) for d in stale],
+                    *[prewarm_dedupe(d) for d in stale],
                     return_exceptions=True
                 )
 
@@ -610,6 +661,20 @@ INDEX_HTML = """<!doctype html>
                         max-height: 60vh; display: block; }
   .player-modal .player-info { color: #6e6e73; font-size: 12px; margin: 10px 0;
                                word-break: break-all; font-family: monospace; }
+  .player-modal .quality { display: flex; align-items: center; gap: 8px;
+                           margin: 6px 0 10px; font-size: 12px; flex-wrap: wrap; }
+  .quality .q-badge { padding: 2px 10px; border-radius: 10px; font-weight: 600;
+                      font-size: 11px; white-space: nowrap; }
+  .q-good { background: #d4f7dc; color: #1e7a2e; }
+  .q-warn { background: #fff3cd; color: #8a6d00; }
+  .q-bad  { background: #fde2e1; color: #c1271c; }
+  .q-init { background: #e5e5ea; color: #6e6e73; }
+  .q-dead { background: #4d4d4d; color: #fff; }
+  .quality .q-metrics { color: #6e6e73; font-family: monospace; flex: 1;
+                        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .quality .btn-mini { padding: 2px 10px; font-size: 11px; margin-left: 0; }
+  td.breaks { font-family: monospace; text-align: center; }
+  td.breaks.warn { color: #c1271c; font-weight: 600; }
   .btn-play { background: #34c759; color: #fff; border-color: #34c759; }
   .btn-play:hover { background: #2eaf4d; }
   .btn-rename { padding: 2px 6px; font-size: 11px; opacity: .6; }
@@ -644,9 +709,9 @@ INDEX_HTML = """<!doctype html>
 
   <table>
     <thead><tr>
-      <th>名称</th><th>deviceId</th><th>接口</th><th>FLV 地址</th><th>保活</th><th>缓存年龄</th><th></th>
+      <th>名称</th><th>deviceId</th><th>接口</th><th>FLV 地址</th><th>保活</th><th>近1h断流</th><th>缓存年龄</th><th></th>
     </tr></thead>
-    <tbody id="tbody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+    <tbody id="tbody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
   </table>
 
   <div class="mask" id="auth-modal">
@@ -674,6 +739,11 @@ INDEX_HTML = """<!doctype html>
     <div class="modal player-modal">
       <h2 id="p-title">视频预览</h2>
       <div class="player-info" id="p-info"></div>
+      <div class="quality">
+        <span class="q-badge q-init" id="p-badge">初始化</span>
+        <span class="q-metrics" id="p-metrics">—</span>
+        <button class="btn btn-mini" id="p-manual-reconnect">手动重连</button>
+      </div>
       <video id="p-video" controls autoplay muted playsinline></video>
       <div class="actions">
         <button class="btn" id="p-close">关闭</button>
@@ -707,6 +777,7 @@ function row(n) {
     '<td>' + badge(n.api) + '</td>' +
     '<td class="flv" title="' + esc(flv) + '">' + (flv ? esc(flv) : '—') + '</td>' +
     '<td>' + badge(n.flv_alive) + '</td>' +
+    '<td class="breaks' + ((n.breaks_1h || 0) > 3 ? ' warn' : '') + '">' + (n.breaks_1h || 0) + '</td>' +
     '<td>' + (n.age_s == null ? '—' : n.age_s + 's') + '</td>' +
     '<td class="actions">' +
       (canPlay ? '<button class="btn btn-play" data-act="play" data-id="' + esc(n.deviceId) + '">▶ 播放</button>' : '') +
@@ -873,11 +944,61 @@ document.getElementById('btn-auth-refresh').onclick = async () => {
   refreshAuth();
 };
 
-// ── FLV 播放器（flv.js）──────────────────
+// ── FLV 播放器（质量监控 + 自动重连）──────────
+const STALL_SOFT_S = 5, STALL_HARD_S = 10, GRACEFUL_START_S = 5;
+const MAX_SOFT = 2, MAX_HARD = 3, MAX_TOTAL = 5;
+const Q_GOOD = { fps: 12, kbps: 100, buf: 0.3 };
+const Q_WARN = { fps: 5,  kbps: 30 };
+const WATCHDOG_MS = 1000;
+
 let __player = null;
+let __playerGen = 0;
+let __watchdog = null;
+let __abortCtl = null;
+let __videoListeners = [];
+let __docListener = null;
+let __currentDeviceId = null;
+let __stats = { lastFrames: 0, lastTs: 0, fps: 0, kbps: 0 };
+let __counters = { soft: 0, hard: 0, total: 0, lastAdvanceTs: 0, lastCt: 0, startedTs: 0 };
+let __reconnecting = false;
+let __manualMode = false;  // 累计达上限或鉴权失败后停止自动,等待用户手动
+
 const playerModal = document.getElementById('player-modal');
 
-function closePlayer() {
+function setBadge(cls, text) {
+  const b = document.getElementById('p-badge');
+  if (b) { b.className = 'q-badge ' + cls; b.textContent = text; }
+}
+function setMetrics(text) {
+  const m = document.getElementById('p-metrics');
+  if (m) m.textContent = text;
+}
+function formatMetrics(fps, kbps, buf, extra) {
+  const parts = [
+    'fps:' + (fps || 0).toFixed(0),
+    'kbps:' + (kbps || 0).toFixed(0),
+    'buf:' + (buf || 0).toFixed(1) + 's',
+  ];
+  if (__counters.total > 0) parts.push('重连' + __counters.total + '/' + MAX_TOTAL);
+  if (extra) parts.push(extra);
+  return parts.join(' · ');
+}
+
+function addVideoListener(v, evt, fn) {
+  v.addEventListener(evt, fn);
+  __videoListeners.push({ evt, fn });
+}
+function clearListeners() {
+  const v = document.getElementById('p-video');
+  if (v) __videoListeners.forEach(({ evt, fn }) => v.removeEventListener(evt, fn));
+  __videoListeners = [];
+  if (__docListener) {
+    document.removeEventListener('visibilitychange', __docListener);
+    __docListener = null;
+  }
+}
+
+function destroyPlayerObj() {
   if (__player) {
     try { __player.pause(); } catch(_) {}
     try { __player.unload(); } catch(_) {}
@@ -885,8 +1006,179 @@ function closePlayer() {
     try { __player.destroy(); } catch(_) {}
     __player = null;
   }
+}
+
+function closePlayer() {
+  __playerGen++;  // 让 in-flight async 回调全部失效
+  if (__watchdog) { clearInterval(__watchdog); __watchdog = null; }
+  if (__abortCtl) { try { __abortCtl.abort(); } catch(_) {} __abortCtl = null; }
+  clearListeners();
+  destroyPlayerObj();
   const v = document.getElementById('p-video');
   if (v) { v.removeAttribute('src'); try { v.load(); } catch(_) {} }
+  __reconnecting = false;
+}
+
+function buildPlayer(src, gen) {
+  const video = document.getElementById('p-video');
+  __player = flvjs.createPlayer({
+    type: 'flv', url: src, isLive: true, hasAudio: false, hasVideo: true,
+  }, {
+    enableWorker: false, enableStashBuffer: false, stashInitialSize: 128,
+    autoCleanupSourceBuffer: true,
+  });
+  __player.attachMediaElement(video);
+  __player.load();
+  __player.play().catch(err => console.warn('play error', err));
+
+  // flv.js STATISTICS_INFO: speed 单位 KB/s,decodedFrames 累计帧 → 差分算 fps
+  __player.on(flvjs.Events.STATISTICS_INFO, (info) => {
+    if (gen !== __playerGen) return;
+    const now = Date.now() / 1000;
+    const frames = info.decodedFrames || 0;
+    if (__stats.lastTs && now > __stats.lastTs) {
+      const dt = now - __stats.lastTs;
+      __stats.fps = Math.max(0, frames - __stats.lastFrames) / dt;
+    }
+    __stats.lastFrames = frames;
+    __stats.lastTs = now;
+    __stats.kbps = (info.speed || 0) * 8;
+  });
+
+  __player.on(flvjs.Events.ERROR, (errType, errDetail) => {
+    if (gen !== __playerGen) return;
+    console.warn('[flv ERROR]', errType, errDetail);
+    scheduleReconnect('hard', errType + ':' + errDetail);
+  });
+}
+
+function updateBadge(stallS, fps, kbps, buf) {
+  if (stallS >= STALL_SOFT_S) {
+    setBadge('q-bad', '卡顿 ' + stallS.toFixed(0) + 's');
+  } else if (fps >= Q_GOOD.fps && kbps >= Q_GOOD.kbps && buf >= Q_GOOD.buf) {
+    setBadge('q-good', '良好');
+  } else if (fps >= Q_WARN.fps && kbps >= Q_WARN.kbps) {
+    setBadge('q-warn', '一般');
+  } else {
+    setBadge('q-bad', '弱');
+  }
+  setMetrics(formatMetrics(fps, kbps, buf));
+}
+
+function tickWatchdog(gen) {
+  if (gen !== __playerGen) return;
+  const v = document.getElementById('p-video');
+  if (!v) return;
+  const now = Date.now() / 1000;
+
+  // 暂停/后台/未就绪 → 不计 stall
+  if (v.paused || document.hidden || v.readyState < 2) {
+    __counters.lastAdvanceTs = now;
+    __counters.lastCt = v.currentTime;
+    if (!__manualMode) {
+      if (v.paused) setBadge('q-init', '已暂停');
+      else if (document.hidden) setBadge('q-init', '后台');
+      else setBadge('q-init', '缓冲中...');
+    }
+    return;
+  }
+
+  // 启动宽限期
+  if (now - __counters.startedTs < GRACEFUL_START_S) {
+    __counters.lastAdvanceTs = now;
+    __counters.lastCt = v.currentTime;
+    setBadge('q-init', '启动中...');
+    setMetrics('—');
+    return;
+  }
+
+  if (v.currentTime > __counters.lastCt + 0.01) {
+    __counters.lastCt = v.currentTime;
+    __counters.lastAdvanceTs = now;
+  }
+  const stallS = now - __counters.lastAdvanceTs;
+  const buf = v.buffered.length
+    ? Math.max(0, v.buffered.end(v.buffered.length - 1) - v.currentTime)
+    : 0;
+
+  if (!__manualMode) updateBadge(stallS, __stats.fps, __stats.kbps, buf);
+
+  if (__manualMode || __reconnecting) return;
+  if (stallS >= STALL_HARD_S) scheduleReconnect('hard', 'stall ' + stallS.toFixed(0) + 's');
+  else if (stallS >= STALL_SOFT_S) scheduleReconnect('soft', 'stall ' + stallS.toFixed(0) + 's');
+}
+
+function rebuildSamePlayer() {
+  destroyPlayerObj();
+  __counters.startedTs = Date.now() / 1000;
+  __counters.lastAdvanceTs = __counters.startedTs;
+  __counters.lastCt = 0;
+  __stats = { lastFrames: 0, lastTs: 0, fps: 0, kbps: 0 };
+  const src = '/__proxy__/flv/' + encodeURIComponent(__currentDeviceId);
+  buildPlayer(src, __playerGen);
+}
+
+async function scheduleReconnect(kind, reason) {
+  if (__reconnecting || __manualMode) return;
+  __reconnecting = true;
+  __counters.total++;
+  console.log('[reconnect]', kind, reason, 'total=' + __counters.total);
+
+  if (__counters.total > MAX_TOTAL) {
+    setBadge('q-dead', '流不可用');
+    setMetrics('累计 ' + __counters.total + ' 次失败,请点"手动重连"重试');
+    __manualMode = true;
+    __reconnecting = false;
+    return;
+  }
+
+  const useSoft = (kind === 'soft' && __counters.soft < MAX_SOFT);
+  const useHard = (!useSoft && __counters.hard < MAX_HARD);
+
+  if (useSoft) {
+    __counters.soft++;
+    setBadge('q-warn', '软重连中…');
+    rebuildSamePlayer();
+    setTimeout(() => { __reconnecting = false; }, 1500);
+    return;
+  }
+  if (!useHard) {
+    setBadge('q-dead', '流不可用');
+    setMetrics('达重试上限,请点"手动重连"');
+    __manualMode = true;
+    __reconnecting = false;
+    return;
+  }
+
+  __counters.hard++;
+  setBadge('q-warn', '硬重连中…(重新拉流)');
+  const gen = __playerGen;
+  __abortCtl = new AbortController();
+  try {
+    const r = await fetch(
+      '/__admin__/api/nests/' + encodeURIComponent(__currentDeviceId) + '/refresh?wait=1',
+      { method: 'POST', signal: __abortCtl.signal }
+    );
+    if (gen !== __playerGen) return;
+    const data = await r.json().catch(() => ({}));
+    const nest = data.nest || {};
+    if (data.ok === false || nest.api === 'failed') {
+      setBadge('q-dead', '上游/鉴权异常');
+      setMetrics('请检查 token 或点"手动重连"');
+      __manualMode = true;
+      return;
+    }
+    if (gen !== __playerGen) return;
+    rebuildSamePlayer();
+  } catch (e) {
+    if (gen !== __playerGen) return;
+    if (e.name === 'AbortError') return;
+    console.warn('hard reconnect fetch failed', e);
+    setBadge('q-bad', '重连失败,稍后重试');
+  } finally {
+    __abortCtl = null;
+    setTimeout(() => { __reconnecting = false; }, 1500);
+  }
 }
 
 function openPlayer(deviceId, name) {
@@ -902,15 +1194,30 @@ function openPlayer(deviceId, name) {
     playerModal.classList.add('show');
     return;
   }
-  __player = flvjs.createPlayer({
-    type: 'flv', url: src, isLive: true, hasAudio: false, hasVideo: true,
-  }, {
-    enableWorker: false, enableStashBuffer: false, stashInitialSize: 128,
-    autoCleanupSourceBuffer: true,
+  __currentDeviceId = deviceId;
+  const t0 = Date.now() / 1000;
+  __counters = { soft: 0, hard: 0, total: 0, lastAdvanceTs: t0, lastCt: 0, startedTs: t0 };
+  __stats = { lastFrames: 0, lastTs: 0, fps: 0, kbps: 0 };
+  __manualMode = false;
+  __reconnecting = false;
+  __playerGen++;
+  const gen = __playerGen;
+
+  setBadge('q-init', '启动中...');
+  setMetrics('—');
+
+  __docListener = () => {
+    if (document.hidden) __counters.lastAdvanceTs = Date.now() / 1000;
+  };
+  document.addEventListener('visibilitychange', __docListener);
+
+  addVideoListener(video, 'error', () => {
+    if (gen !== __playerGen) return;
+    console.warn('[video error]', video.error);
   });
-  __player.attachMediaElement(video);
-  __player.load();
-  __player.play().catch(err => console.warn('play error', err));
+
+  buildPlayer(src, gen);
+  __watchdog = setInterval(() => tickWatchdog(gen), WATCHDOG_MS);
   playerModal.classList.add('show');
 }
 
@@ -924,6 +1231,15 @@ playerModal.onclick = (e) => {
     playerModal.classList.remove('show');
   }
 };
+document.getElementById('p-manual-reconnect').onclick = () => {
+  if (!__currentDeviceId) return;
+  // 重置允许再来一轮
+  __counters.hard = 0;
+  __counters.soft = 0;
+  __manualMode = false;
+  __reconnecting = false;
+  scheduleReconnect('hard', 'manual');
+};
 
 refreshAll();
 setInterval(refreshAll, 3000);
@@ -935,6 +1251,7 @@ setInterval(refreshAll, 3000);
 
 def _nest_status(device_id: str) -> dict:
     entry = _cache.get(device_id)
+    last_break = _device_last_break(device_id)
     return {
         "deviceId": device_id,
         "name": _nest_names.get(device_id, ""),
@@ -943,6 +1260,8 @@ def _nest_status(device_id: str) -> dict:
         "age_s": round(entry.age(), 1) if entry else None,
         "flv_url": entry.flv_url if entry else None,
         "flv_alive": _flv_alive.get(entry.flv_url) if entry and entry.flv_url else None,
+        "breaks_1h": _device_breaks_1h(device_id),
+        "last_break_at": round(last_break, 1) if last_break else None,
     }
 
 
@@ -1029,7 +1348,7 @@ async def admin_add_nest(request: Request):
     NEST_DEVICE_IDS.append(device_id)
     _nest_names[device_id] = name
     _persist_nests()
-    asyncio.create_task(prewarm(device_id))
+    asyncio.create_task(prewarm_dedupe(device_id))
     return {"ok": True, "deviceId": device_id, "name": name}
 
 
@@ -1069,10 +1388,19 @@ async def admin_delete_nest(device_id: str):
 
 
 @app.post("/__admin__/api/nests/{device_id}/refresh")
-async def admin_refresh_nest(device_id: str):
+async def admin_refresh_nest(device_id: str, wait: int = 0):
+    """重新调 startLive 拿新 flv_url。
+    ?wait=1 时同步等 prewarm 完成(最多 8s)并返回新状态,前端硬重连用。
+    ?wait=0 (默认) 时 fire-and-forget,保持向后兼容。"""
     if device_id not in NEST_DEVICE_IDS:
         raise HTTPException(404, "deviceId not found")
-    asyncio.create_task(prewarm(device_id))
+    if wait:
+        try:
+            ok = await asyncio.wait_for(prewarm_dedupe(device_id), timeout=8.0)
+        except asyncio.TimeoutError:
+            ok = False
+        return {"ok": ok, "nest": _nest_status(device_id)}
+    asyncio.create_task(prewarm_dedupe(device_id))
     return {"ok": True}
 
 
@@ -1205,7 +1533,7 @@ async def proxy(request: Request, path: str):
         skip = {"transfer-encoding", "content-encoding", "content-length"}
         headers = {k: v for k, v in entry.headers.items() if k.lower() not in skip}
         if entry.age() > CACHE_TTL * 0.5:
-            asyncio.create_task(prewarm(device_id))  # 提前后台刷新
+            asyncio.create_task(prewarm_dedupe(device_id))  # 提前后台刷新
         return Response(entry.body, entry.status_code, headers)
 
     # ⏳ 缓存未命中（首次启动窗口期）→ 实时请求
