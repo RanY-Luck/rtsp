@@ -945,8 +945,8 @@ document.getElementById('btn-auth-refresh').onclick = async () => {
 };
 
 // ── FLV 播放器（质量监控 + 自动重连）──────────
-const STALL_SOFT_S = 5, STALL_HARD_S = 10, GRACEFUL_START_S = 5;
-const MAX_SOFT = 2, MAX_HARD = 3, MAX_TOTAL = 5;
+const STALL_HARD_S = 6, STALL_WARN_S = 3, GRACEFUL_START_S = 5;
+const MAX_HARD = 5, MAX_TOTAL = 5;
 const Q_GOOD = { fps: 12, kbps: 100, buf: 0.3 };
 const Q_WARN = { fps: 5,  kbps: 30 };
 const WATCHDOG_MS = 1000;
@@ -959,9 +959,10 @@ let __videoListeners = [];
 let __docListener = null;
 let __currentDeviceId = null;
 let __stats = { lastFrames: 0, lastTs: 0, fps: 0, kbps: 0 };
-let __counters = { soft: 0, hard: 0, total: 0, lastAdvanceTs: 0, lastCt: 0, startedTs: 0 };
+let __counters = { hard: 0, total: 0, lastAdvanceTs: 0, lastCt: 0, startedTs: 0 };
 let __reconnecting = false;
 let __manualMode = false;  // 累计达上限或鉴权失败后停止自动,等待用户手动
+let __userPaused = false;  // 用户主动按暂停按钮(区别于流断引起的自动 pause)
 
 const playerModal = document.getElementById('player-modal');
 
@@ -1017,6 +1018,7 @@ function closePlayer() {
   const v = document.getElementById('p-video');
   if (v) { v.removeAttribute('src'); try { v.load(); } catch(_) {} }
   __reconnecting = false;
+  __userPaused = false;
 }
 
 function buildPlayer(src, gen) {
@@ -1048,12 +1050,22 @@ function buildPlayer(src, gen) {
   __player.on(flvjs.Events.ERROR, (errType, errDetail) => {
     if (gen !== __playerGen) return;
     console.warn('[flv ERROR]', errType, errDetail);
-    scheduleReconnect('hard', errType + ':' + errDetail);
+    scheduleReconnect(errType + ':' + errDetail);
+  });
+
+  // 直播流不应该"加载完成",出现 LOADING_COMPLETE = 上游断流(EOS)
+  __player.on(flvjs.Events.LOADING_COMPLETE, () => {
+    if (gen !== __playerGen) return;
+    console.warn('[flv] LOADING_COMPLETE (上游 EOS) → 重连');
+    if (!__reconnecting && !__manualMode) scheduleReconnect('LOADING_COMPLETE');
+  });
+  __player.on(flvjs.Events.RECOVERED_EARLY_EOF, () => {
+    console.log('[flv] RECOVERED_EARLY_EOF');
   });
 }
 
 function updateBadge(stallS, fps, kbps, buf) {
-  if (stallS >= STALL_SOFT_S) {
+  if (stallS >= STALL_WARN_S) {
     setBadge('q-bad', '卡顿 ' + stallS.toFixed(0) + 's');
   } else if (fps >= Q_GOOD.fps && kbps >= Q_GOOD.kbps && buf >= Q_GOOD.buf) {
     setBadge('q-good', '良好');
@@ -1071,15 +1083,19 @@ function tickWatchdog(gen) {
   if (!v) return;
   const now = Date.now() / 1000;
 
-  // 暂停/后台/未就绪 → 不计 stall
-  if (v.paused || document.hidden || v.readyState < 2) {
+  // 后台:不计 stall
+  if (document.hidden) {
     __counters.lastAdvanceTs = now;
     __counters.lastCt = v.currentTime;
-    if (!__manualMode) {
-      if (v.paused) setBadge('q-init', '已暂停');
-      else if (document.hidden) setBadge('q-init', '后台');
-      else setBadge('q-init', '缓冲中...');
-    }
+    if (!__manualMode) setBadge('q-init', '后台');
+    return;
+  }
+
+  // 用户主动暂停:不计 stall
+  if (__userPaused) {
+    __counters.lastAdvanceTs = now;
+    __counters.lastCt = v.currentTime;
+    setBadge('q-init', '已暂停');
     return;
   }
 
@@ -1092,6 +1108,7 @@ function tickWatchdog(gen) {
     return;
   }
 
+  // currentTime 推进检测
   if (v.currentTime > __counters.lastCt + 0.01) {
     __counters.lastCt = v.currentTime;
     __counters.lastAdvanceTs = now;
@@ -1104,8 +1121,19 @@ function tickWatchdog(gen) {
   if (!__manualMode) updateBadge(stallS, __stats.fps, __stats.kbps, buf);
 
   if (__manualMode || __reconnecting) return;
-  if (stallS >= STALL_HARD_S) scheduleReconnect('hard', 'stall ' + stallS.toFixed(0) + 's');
-  else if (stallS >= STALL_SOFT_S) scheduleReconnect('soft', 'stall ' + stallS.toFixed(0) + 's');
+
+  // 流断特征 1: video 自动 pause + buffer 耗尽 → 立即重连
+  if (v.paused && buf < 0.1) {
+    scheduleReconnect('auto-pause(buf=' + buf.toFixed(2) + ')');
+    return;
+  }
+  // 流断特征 2: readyState 降低 + buffer 耗尽 + 持续 >=2s → 重连
+  if (v.readyState < 2 && buf < 0.1 && stallS >= 2) {
+    scheduleReconnect('stalled(ready=' + v.readyState + ')');
+    return;
+  }
+  // 常规 stall
+  if (stallS >= STALL_HARD_S) scheduleReconnect('stall ' + stallS.toFixed(0) + 's');
 }
 
 function rebuildSamePlayer() {
@@ -1118,13 +1146,13 @@ function rebuildSamePlayer() {
   buildPlayer(src, __playerGen);
 }
 
-async function scheduleReconnect(kind, reason) {
+async function scheduleReconnect(reason) {
   if (__reconnecting || __manualMode) return;
   __reconnecting = true;
   __counters.total++;
-  console.log('[reconnect]', kind, reason, 'total=' + __counters.total);
+  console.log('[reconnect]', reason, 'total=' + __counters.total);
 
-  if (__counters.total > MAX_TOTAL) {
+  if (__counters.total > MAX_TOTAL || __counters.hard >= MAX_HARD) {
     setBadge('q-dead', '流不可用');
     setMetrics('累计 ' + __counters.total + ' 次失败,请点"手动重连"重试');
     __manualMode = true;
@@ -1132,26 +1160,8 @@ async function scheduleReconnect(kind, reason) {
     return;
   }
 
-  const useSoft = (kind === 'soft' && __counters.soft < MAX_SOFT);
-  const useHard = (!useSoft && __counters.hard < MAX_HARD);
-
-  if (useSoft) {
-    __counters.soft++;
-    setBadge('q-warn', '软重连中…');
-    rebuildSamePlayer();
-    setTimeout(() => { __reconnecting = false; }, 1500);
-    return;
-  }
-  if (!useHard) {
-    setBadge('q-dead', '流不可用');
-    setMetrics('达重试上限,请点"手动重连"');
-    __manualMode = true;
-    __reconnecting = false;
-    return;
-  }
-
   __counters.hard++;
-  setBadge('q-warn', '硬重连中…(重新拉流)');
+  setBadge('q-warn', '重连中…(重新拉流)');
   const gen = __playerGen;
   __abortCtl = new AbortController();
   try {
@@ -1196,10 +1206,11 @@ function openPlayer(deviceId, name) {
   }
   __currentDeviceId = deviceId;
   const t0 = Date.now() / 1000;
-  __counters = { soft: 0, hard: 0, total: 0, lastAdvanceTs: t0, lastCt: 0, startedTs: t0 };
+  __counters = { hard: 0, total: 0, lastAdvanceTs: t0, lastCt: 0, startedTs: t0 };
   __stats = { lastFrames: 0, lastTs: 0, fps: 0, kbps: 0 };
   __manualMode = false;
   __reconnecting = false;
+  __userPaused = false;
   __playerGen++;
   const gen = __playerGen;
 
@@ -1214,6 +1225,30 @@ function openPlayer(deviceId, name) {
   addVideoListener(video, 'error', () => {
     if (gen !== __playerGen) return;
     console.warn('[video error]', video.error);
+  });
+
+  // 区分用户主动暂停 vs 流断自动暂停(基于 buffer 剩余量)
+  addVideoListener(video, 'pause', () => {
+    if (gen !== __playerGen) return;
+    const now = Date.now() / 1000;
+    if (now - __counters.startedTs < GRACEFUL_START_S) return;  // 启动期忽略
+    const buf = video.buffered.length
+      ? video.buffered.end(video.buffered.length - 1) - video.currentTime
+      : 0;
+    if (buf >= 0.5) {
+      console.log('[pause] user (buf=' + buf.toFixed(1) + 's)');
+      __userPaused = true;
+    } else {
+      console.warn('[pause] auto, buf=' + buf.toFixed(2) + ' → reconnect');
+      __userPaused = false;
+      if (!__reconnecting && !__manualMode) {
+        scheduleReconnect('auto-pause(buf=' + buf.toFixed(2) + ')');
+      }
+    }
+  });
+  addVideoListener(video, 'play', () => {
+    if (gen !== __playerGen) return;
+    __userPaused = false;
   });
 
   buildPlayer(src, gen);
@@ -1235,10 +1270,10 @@ document.getElementById('p-manual-reconnect').onclick = () => {
   if (!__currentDeviceId) return;
   // 重置允许再来一轮
   __counters.hard = 0;
-  __counters.soft = 0;
   __manualMode = false;
   __reconnecting = false;
-  scheduleReconnect('hard', 'manual');
+  __userPaused = false;
+  scheduleReconnect('manual');
 };
 
 refreshAll();
@@ -1477,8 +1512,12 @@ async def proxy_flv(device_id: str):
                     return
                 async for chunk in r.content.iter_chunked(8192):
                     yield chunk
+                log.info(f"[FLV-PROXY] {device_id} 上游正常 EOF (chunked 结束)")
         except asyncio.CancelledError:
             raise
+        except aiohttp.ClientPayloadError as e:
+            # 上游推流端主动断流的典型表现(Content-Length 未满 / TransferEncodingError)
+            log.warning(f"[FLV-PROXY] {device_id} 上游主动断流(payload): {e}")
         except Exception as e:
             log.warning(f"[FLV-PROXY] {device_id} 异常: {e}")
 
