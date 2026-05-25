@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir \
         -r requirements.txt
 
 COPY stream_proxy.py .
+COPY static ./static
 
 # 持久化目录（机巢列表 nests.json）。docker-compose 用卷挂载该目录
 RUN mkdir -p /app/data

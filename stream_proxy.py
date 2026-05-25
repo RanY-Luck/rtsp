@@ -536,7 +536,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>DJI 机巢代理 — 管理</title>
-<script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
+<script src="/__admin__/static/flv.min.js"></script>
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -980,6 +980,31 @@ def _auth_status() -> dict:
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return INDEX_HTML
+
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/__admin__/static/{filename}")
+async def admin_static(filename: str):
+    # 仅允许文件名（无路径分隔符），防止目录穿越
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(400, "invalid filename")
+    path = _STATIC_DIR / filename
+    if not path.is_file():
+        raise HTTPException(404, "not found")
+    ext = path.suffix.lower()
+    mime = {
+        ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".map": "application/json",
+    }.get(ext, "application/octet-stream")
+    return Response(
+        content=path.read_bytes(),
+        media_type=mime,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/__admin__/api/nests")

@@ -31,7 +31,7 @@ tar czf "${DEPLOY_BUNDLE}" \
     "${IMAGE_TAR}" \
     docker-compose.yml \
     stream_proxy.py \
-    "${COMPOSE_FILES[@]}"
+    ${COMPOSE_FILES[@]+"${COMPOSE_FILES[@]}"}
 
 # 清理临时拷贝
 [ -f docker-compose-linux-x86_64 ] && rm -f docker-compose-linux-x86_64
