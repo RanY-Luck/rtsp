@@ -13,3 +13,4 @@ drone/
 *.tar.gz
 *.tar
 .drone/
+.pig-ui/
